@@ -1,4 +1,5 @@
-<img width="1175" height="708" alt="Screenshot 2026-07-31 164537" src="https://github.com/user-attachments/assets/70270f0a-3aa1-4a7c-9b57-b7e8f989b975" />
+<img width="1179" height="710" alt="image" src="https://github.com/user-attachments/assets/a7750c07-6f99-4f72-a822-871c506b3751" />
+
 # AuctionWatch
 
 A standalone desktop app for browsing **FFXI items** and their **live Auction House
