@@ -20,13 +20,17 @@ import json
 import gzip
 import re
 import math
+import mmap
+import struct
 import threading
+import zlib
 import datetime
 import statistics
 import webbrowser
 import collections as _collections
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 
 _DEFAULT_SERVER = "124.150.154.63"
 
@@ -795,6 +799,54 @@ def search_items(q, limit=300):
     return hits[:limit]
 
 
+def _parse_dmg(desc):
+    m = re.search(r"DMG:\s*(\d+)", desc or "")
+    return int(m.group(1)) if m else None
+
+
+def _build_disambig():
+    # For items that SHARE a display name (REMA upgrade stages, etc.) attach a
+    # short suffix so the results list can tell them apart: item level (or level),
+    # with weapon DMG as the tiebreaker when stages share a level. Items with no
+    # level/DMG that happen to collide are left as-is (not weapons we care about).
+    from collections import defaultdict, Counter
+    groups = defaultdict(list)
+    for k, v in ITEMS.items():
+        groups[(v.get("n", "")).lower()].append(int(k))
+    out = {}
+    for _name, ids in groups.items():
+        if len(ids) < 2:
+            continue
+
+        def lvtag(iid):
+            it = ITEMS[str(iid)]
+            if it.get("il"):
+                return "iLv %d" % it["il"]
+            if it.get("lv"):
+                return "Lv %d" % it["lv"]
+            return ""
+
+        base = {iid: lvtag(iid) for iid in ids}
+        counts = Counter(base.values())
+        for iid in ids:
+            tag = base[iid]
+            if tag == "" or counts[tag] > 1:
+                dmg = _parse_dmg(ITEMS[str(iid)].get("d", ""))
+                if dmg is not None:
+                    tag = ("%s  DMG %d" % (tag, dmg)).strip()
+            if tag:
+                out[iid] = tag
+    return out
+
+
+_DISAMBIG = _build_disambig()
+
+
+def _list_label(name, iid):
+    suf = _DISAMBIG.get(iid)
+    return ("%s   —   %s" % (name, suf)) if suf else name
+
+
 _JOB_ABBR = {1: "WAR", 2: "MNK", 3: "WHM", 4: "BLM", 5: "RDM", 6: "THF",
              7: "PLD", 8: "DRK", 9: "BST", 10: "BRD", 11: "RNG", 12: "SAM",
              13: "NIN", 14: "DRG", 15: "SMN", 16: "BLU", 17: "COR", 18: "PUP",
@@ -858,10 +910,13 @@ _DEFAULT_SERVERS = {
 }
 
 
-def _servers_path():
-    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+def _appdata_dir():
+    return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
                         "AuctionWatch")
-    return os.path.join(base, "servers.json")
+
+
+def _servers_path():
+    return os.path.join(_appdata_dir(), "servers.json")
 
 
 def _load_servers():
@@ -877,9 +932,7 @@ def _load_servers():
 
 
 def _ui_path():
-    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                        "AuctionWatch")
-    return os.path.join(base, "ui.json")
+    return os.path.join(_appdata_dir(), "ui.json")
 
 
 def _load_ui():
@@ -911,6 +964,1058 @@ def _save_servers(d):
         pass
 
 
+# ─────────────────────────── item icons ───────────────────────────
+#
+# WHERE ICONS COME FROM, AND WHY THERE IS NOTHING TO SET UP
+#
+# The 32x32 icon for an item lives in the client's own item DATs, on the same PC
+# this app runs on, so there is nothing to download and nowhere to point it. The
+# first icon asked for makes the app work out where the item records sit (see
+# _solve_range); after that every icon is a seek into a memory-mapped file. Each
+# one decoded is written out as <id>.png under %APPDATA%/AuctionWatch/itemicons,
+# so the second run is pure file reads and the game need not even be installed.
+#
+# A folder of pngs named <id>.png is read in preference to any of that. It can sit
+# next to the app or under %APPDATA%/AuctionWatch, and be called itemicons, items,
+# icons/items or just icons -- all of them are looked in, along with OmniWatch's
+# extracted set and a sibling MobileWatch checkout's assets. Nothing has to be told
+# where it is; the app finds out which of them exists on its own.
+#
+# If none of it is there -- no game, no folder -- nothing is drawn and no space is
+# reserved, so the lists and the card look exactly as they did before icons.
+
+_ICON_W = _ICON_H = 32
+_ICON_BYTES = 0x800                 # 0x400 palette + 0x400 indices
+_STD_STRIDE = 0x1400                # item record size (was 0xC00 before a 2026 patch)
+_STD_ICON_OFFSET = 0x2BD            # where the icon sits inside a record
+
+# The DAT is bit-rotated: low 5 bits move up, high 3 bits move down.
+_ROT = [(i % 0x20) * 8 + i // 0x20 for i in range(256)]
+_UNROT = [0] * 256
+for _e, _n in enumerate(_ROT):
+    _UNROT[_n] = _e
+
+# id -> DAT, from Rubenator's icon_extractor.lua. The right starting guess; where an
+# install disagrees, the name anchors below correct it.
+_ITEM_DAT_MAP = [
+    (0x0001, 0x0FFF, "118/106", -1, "General Items"),
+    (0x1000, 0x1FFF, "118/107", 0, "Usable Items"),
+    (0x2000, 0x21FF, "118/110", 0, "Automaton Items"),
+    (0x2200, 0x27FF, "301/115", 0, "General Items 2"),
+    (0x2800, 0x3FFF, "118/109", 0, "Armor Items"),
+    (0x4000, 0x59FF, "118/108", 0, "Weapon Items"),
+    (0x5A00, 0x6FFF, "286/73", 0, "Armor Items 2"),
+    (0x7000, 0x73FF, "217/21", 0, "Maze Items, Basic Items"),
+    (0x7400, 0x77FF, "288/80", 0, "Instinct Items"),
+    (0xF000, 0xF1FF, "288/67", 0, "Monipulator Items"),
+    (0xFFFF, 0xFFFF, "174/48", 0, "Gil"),
+]
+
+# Known id -> name, spread across each range, used to locate the records outright.
+# Instinct and Monipulator items are absent from Windower's resources, so those two
+# ranges can only ever run on the standard layout.
+_ICON_ANCHORS = {
+    "General Items": [(1, "Chocobo Bedding"), (633, "Olive Oil"), (1148, "Shoalweed"), (1631, "Moblin Armor"), (2092, "Sao. Sune-Ate -1"), (2617, "Chamrosh's Beak"), (3078, "Cracked Drgscale."), (3537, "Kupon A-Rub")],
+    "Usable Items": [(4096, "Fire Crystal"), (4403, "Yellow Globe"), (4850, "Refresh II"), (5209, "Diatryma Meat"), (5509, "E. Tincture (BS)"), (5833, "Mana Mist"), (6141, "O. Bolt Quiver"), (6406, "Pork Cutlet Bowl")],
+    "General Items 2": [(8704, "Bismuth Ingot"), (8871, "Leath. Kit 55"), (9052, "Golden Coil"), (9260, "A. Token: Head"), (9423, "Smith. Set 65"), (9584, "Voidhead: DNC"), (9745, "Voidfoot: BLM"), (9962, "Tem. N-F7")],
+    "Armor Items": [(10240, "Hexed Haubert"), (11017, "Soil Pearl"), (11770, "Accursed Belt"), (12540, "Alluring Headband"), (13338, "Blood Earring"), (14087, "Gilt Sabatons"), (14842, "Ivory Mitts"), (15602, "Pup. Churidars")],
+    "Weapon Items": [(16386, "Lizard Cesti"), (16995, "Rotten Meat"), (17558, "Apollo's Staff"), (18116, "Engetsuto +1"), (18765, "Oberon's Sainti"), (19511, "Naboot +1"), (20918, "Dimmet Scythe"), (21576, "Bard's Knife")],
+    "Armor Items 2": [(23040, "Pummeler's Mask +2"), (23570, "Chasseur's Gants +3"), (24122, "Revelation Masque"), (25739, "Aldo Unity Shirt"), (26440, "Plaiter's Scutum"), (27053, "Boii Mufflers +1"), (27578, "Fenrir Ring"), (28127, "Laksa. Trews +1")],
+    "Maze Items, Basic Items": [(28672, "Maze Tabula M01"), (28803, "Maze Rune 004"), (28821, "Maze Rune 022"), (28839, "Maze Rune 040"), (28875, "Maze Rune 076"), (28893, "Maze Rune 094"), (28912, "Maze Rune 113"), (29323, "Storage Slip 12")],
+    "Gil": [(65535, "Gil")],
+}
+
+# A candidate layout must clear both of these across its sample records.
+_BLANK_OPAQUE = 0.02       # below this the record has no artwork; not a failure
+_CLEAN_MID = 0.01          # a real icon has essentially no partial-alpha pixels
+_MIN_CLEAN_RATE = 0.55     # genuine ranges score 0.70-1.00; misreads score 0.00-0.17
+_MIN_SAMPLES = 5
+
+
+def _icon_decode(block):
+    """0x800 bytes -> list of 32 RGBA rows, top-down, or None if the record is blank."""
+    if len(block) < _ICON_BYTES or not any(block[:_ICON_BYTES]):
+        return None
+    pal = bytearray(0x400)
+    raw = block[:0x400]
+    for j in range(0x400):
+        n = _ROT[raw[j]]
+        if j & 3 == 3:                      # alpha is stored 0-127 and doubled
+            n = n * 2
+            if n > 0xFF:
+                n = 0xFF
+        pal[j] = n
+    idx = block[0x400:0x800]
+    rows = []
+    for y in range(_ICON_H):
+        row = bytearray(_ICON_W * 4)
+        base = y * _ICON_W
+        for x in range(_ICON_W):
+            p = _ROT[idx[base + x]] * 4
+            o = x * 4
+            row[o] = pal[p + 2]             # stored B,G,R,A
+            row[o + 1] = pal[p + 1]
+            row[o + 2] = pal[p]
+            row[o + 3] = pal[p + 3]
+        rows.append(bytes(row))
+    rows.reverse()                          # stored bottom-up like a BMP
+    return rows
+
+
+def _icon_alpha_profile(block):
+    """(mid_fraction, opaque_fraction), decoding ONLY alpha.
+
+    REAL FFXI ICONS USE BINARY ALPHA -- a pixel is fully transparent or fully solid.
+    That is the test that tells a genuine record layout from a misread of packed game
+    data; scoring on what the result "looks like" cannot, and once produced 14,000
+    files of noise that scored inside the genuine band."""
+    if len(block) < _ICON_BYTES or not any(block[:_ICON_BYTES]):
+        return None
+    alpha = [0] * 256
+    raw = block[:0x400]
+    for i in range(256):
+        n = _ROT[raw[i * 4 + 3]] * 2
+        alpha[i] = 0xFF if n > 0xFF else n
+    mid = op = 0
+    for b in block[0x400:0x800]:
+        a = alpha[_ROT[b]]
+        if 16 < a < 240:
+            mid += 1
+        elif a >= 240:
+            op += 1
+    return mid / 1024.0, op / 1024.0
+
+
+def _icon_validate(data, a0, stride, ids):
+    """Check a layout: the icon for id sits at a0 + id * stride.
+
+    Returns (clean_rate, n_nonblank). A one-item range (Gil) can never reach the
+    normal sample count, so the requirement scales to the range."""
+    clean = nonblank = 0
+    for i in ids:
+        p = a0 + i * stride
+        if p < 0 or p + _ICON_BYTES > len(data):
+            continue
+        prof = _icon_alpha_profile(data[p:p + _ICON_BYTES])
+        if prof is None or prof[1] < _BLANK_OPAQUE:
+            continue
+        nonblank += 1
+        if prof[0] <= _CLEAN_MID:
+            clean += 1
+    if nonblank < min(_MIN_SAMPLES, max(1, len(ids))):
+        return 0.0, nonblank
+    return clean / nonblank, nonblank
+
+
+def _icon_encode_png(rows):
+    def chunk(tag, payload):
+        c = struct.pack(">I", len(payload)) + tag + payload
+        return c + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + r for r in rows)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", _ICON_W, _ICON_H, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
+def _icon_sample_ids(lo, hi, n=24):
+    step = max(1, (hi - lo + 1) // n)
+    return list(range(lo, hi + 1, step))[:n]
+
+
+def _icon_find_anchors(data, anchors):
+    """id -> byte position of that item's name in the file. Unambiguous hits only."""
+    found = {}
+    for item_id, name in anchors:
+        if len(name) < 4:
+            continue
+        raw = name.encode("ascii", "ignore")
+        for pat in (raw, bytes(_UNROT[b] for b in raw)):
+            first = data.find(pat)
+            if first < 0 or data.find(pat, first + 1) >= 0:
+                continue
+            found[item_id] = first
+            break
+    return found
+
+
+def _icon_alignment(found):
+    """(stride, base) with name_pos(id) == base + id * stride, or None.
+
+    Two anchors imply a stride; it is taken only if every anchor lands exactly where
+    that stride predicts, which makes it ground truth rather than a guess."""
+    ids = sorted(found)
+    if len(ids) < 3:
+        return None
+    best = None
+    for a in range(len(ids)):
+        for b in range(a + 1, len(ids)):
+            di = ids[b] - ids[a]
+            dp = found[ids[b]] - found[ids[a]]
+            if di <= 0 or dp <= 0 or dp % di:
+                continue
+            stride = dp // di
+            if not (0x400 <= stride <= 0x4000):
+                continue
+            base = found[ids[a]] - ids[a] * stride
+            agree = sum(1 for i in ids if found[i] == base + i * stride)
+            if agree >= max(3, len(ids) - 1) and (best is None or agree > best[2]):
+                best = (stride, base, agree)
+    return (best[0], best[1]) if best else None
+
+
+def _icon_find_ffxi():
+    for c in (r"C:\Program Files (x86)\SquareEnix\SquareEnix\FINAL FANTASY XI",
+              r"C:\Program Files (x86)\PlayOnline\SquareEnix\FINAL FANTASY XI",
+              r"C:\Program Files\PlayOnline\SquareEnix\FINAL FANTASY XI",
+              r"C:\PlayOnline\SquareEnix\FINAL FANTASY XI",
+              r"D:\PlayOnline\SquareEnix\FINAL FANTASY XI",
+              r"D:\SquareEnix\FINAL FANTASY XI"):
+        if os.path.isdir(os.path.join(c, "ROM")):
+            return c
+    return None
+
+
+# What a folder of dumped icons tends to get called. All of them are looked in, so
+# the set can be dropped wherever it lands without telling the app about it.
+_ICON_SUBDIRS = (("itemicons",), ("items",), ("icons", "items"),
+                 ("icons", "itemicons"), ("icons",))
+
+
+def _icon_dirs():
+    """Folders of <id>.png, best first. The cache the app writes comes before the
+    read-only sets so a freshly decoded icon is found without a directory walk."""
+    dirs = []
+    bases = []
+    mei = getattr(sys, "_MEIPASS", None)
+    if mei:
+        bases.append(mei)
+    here = os.path.dirname(os.path.abspath(
+        sys.argv[0] if getattr(sys, "frozen", False) else __file__))
+    bases.append(here)
+    dirs.append(_icon_cache_dir())
+    bases.append(_appdata_dir())
+    for base in bases:
+        for parts in _ICON_SUBDIRS:
+            dirs.append(os.path.join(base, *parts))
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    dirs.append(os.path.join(appdata, "OmniWatch", "icons", "equipment"))
+    dirs.append(os.path.join(appdata, "OmniWatch", "icons", "items"))
+    # A MobileWatch checkout sitting beside this one already has the whole set.
+    for up in (here, os.path.dirname(here), os.path.dirname(os.path.dirname(here))):
+        try:
+            names = os.listdir(up)
+        except OSError:
+            continue
+        for n in names:
+            if "mobilewatch" in n.lower():
+                dirs.append(os.path.join(up, n, "app", "src", "main",
+                                         "assets", "itemicons"))
+    seen, out = set(), []
+    for d in dirs:
+        k = os.path.normcase(os.path.abspath(d))
+        if k not in seen:
+            seen.add(k)
+            out.append(d)
+    return out
+
+
+def _icon_cache_dir():
+    return os.path.join(_appdata_dir(), "itemicons")
+
+
+class _IconStore:
+    """Finds an item's png: a folder first, then the client's DATs.
+
+    Everything here is called from a worker thread. Tk objects are never touched --
+    the caller turns the bytes into a PhotoImage on the main thread."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._dirs = None
+        self._ffxi = None
+        self._ranges = {}        # label -> (mmap, a0, stride) or None once refused
+        self._open = []          # the DAT handles the mappings are built on
+        self._layout = {}        # label -> dict, remembered across runs
+        self._layout_loaded = False
+        self._missing = set()
+        self.found_any = False   # flips true on the first icon that resolves
+
+    # -- folders ----------------------------------------------------------
+    def _folder_png(self, iid):
+        if self._dirs is None:
+            self._dirs = _icon_dirs()
+        name = "%d.png" % iid
+        for d in self._dirs:
+            p = os.path.join(d, name)
+            try:
+                if os.path.isfile(p):
+                    with open(p, "rb") as f:
+                        return f.read()
+            except OSError:
+                pass
+        return None
+
+    # -- DATs -------------------------------------------------------------
+    def _layout_path(self):
+        return os.path.join(_appdata_dir(), "iconlayout.json")
+
+    def _load_layout(self):
+        if self._layout_loaded:
+            return
+        self._layout_loaded = True
+        try:
+            with open(self._layout_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                self._layout = d
+        except Exception:
+            pass
+
+    def _save_layout(self):
+        try:
+            p = self._layout_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(self._layout, f, indent=2)
+        except Exception:
+            pass
+
+    def _entry_for(self, iid):
+        for lo, hi, rel, off, label in _ITEM_DAT_MAP:
+            if lo <= iid <= hi:
+                return lo, hi, rel, off, label
+        return None
+
+    def _open_range(self, entry):
+        """(mmap, a0, stride) for an id range, solving the layout the first time.
+
+        The standard layout is tried FIRST and kept when it validates, so ranges that
+        already decode are never disturbed by a cleverer theory. Name anchors are only
+        brought in when it fails, which is the case the 2021 table gets wrong."""
+        lo, hi, rel, off, label = entry
+        if label in self._ranges:
+            return self._ranges[label]
+        self._ranges[label] = None          # refuse by default; replaced on success
+        if self._ffxi is None:
+            self._ffxi = _icon_find_ffxi() or False
+        if not self._ffxi:
+            return None
+        path = os.path.join(self._ffxi, "ROM", *rel.split("/")) + ".DAT"
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        try:
+            f = open(path, "rb")
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError):
+            return None
+        self._open.append(f)
+
+        self._load_layout()
+        cached = self._layout.get(label)
+        if (isinstance(cached, dict) and cached.get("size") == st.st_size
+                and int(cached.get("mtime", -1)) == int(st.st_mtime)):
+            got = (mm, int(cached["a0"]), int(cached["stride"]))
+            self._ranges[label] = got
+            return got
+
+        ids = _icon_sample_ids(lo, hi)
+        a0 = -(lo + off) * _STD_STRIDE + _STD_ICON_OFFSET
+        stride = _STD_STRIDE
+        rate, _n = _icon_validate(mm, a0, stride, ids)
+        if rate < _MIN_CLEAN_RATE:
+            a0 = None
+            found = _icon_find_anchors(mm, _ICON_ANCHORS.get(label, []))
+            align = _icon_alignment(found) if len(found) >= 3 else None
+            if align:
+                stride, base = align
+                rec0 = base - (base % stride)       # start of the record for id 0
+                cand = rec0 + _STD_ICON_OFFSET
+                rate, _n = _icon_validate(mm, cand, stride, ids)
+                if rate >= _MIN_CLEAN_RATE:
+                    a0 = cand
+                else:
+                    # Scan the record for it -- and keep the BEST offset, not the
+                    # first one over the line. A block that straddles the real icon
+                    # can pass the bar while reading half a record early.
+                    best = (None, 0.0, 0)
+                    for k in range(0, stride - _ICON_BYTES + 1):
+                        r, nb = _icon_validate(mm, rec0 + k, stride, ids)
+                        if r > best[1] or (r == best[1] and nb > best[2]):
+                            best = (rec0 + k, r, nb)
+                        if r >= 0.95 and nb >= 10:
+                            break
+                    if best[1] >= _MIN_CLEAN_RATE:
+                        a0 = best[0]
+        if a0 is None:
+            mm.close()
+            f.close()
+            return None                      # refused: better nothing than noise
+        self._layout[label] = {"a0": a0, "stride": stride,
+                               "size": st.st_size, "mtime": int(st.st_mtime)}
+        self._save_layout()
+        got = (mm, a0, stride)
+        self._ranges[label] = got
+        return got
+
+    def _dat_png(self, iid):
+        entry = self._entry_for(iid)
+        if entry is None:
+            return None
+        got = self._open_range(entry)
+        if not got:
+            return None
+        mm, a0, stride = got
+        p = a0 + iid * stride
+        if p < 0 or p + _ICON_BYTES > len(mm):
+            return None
+        rows = _icon_decode(mm[p:p + _ICON_BYTES])
+        if rows is None:
+            return None
+        png = _icon_encode_png(rows)
+        try:
+            d = _icon_cache_dir()
+            os.makedirs(d, exist_ok=True)
+            tmp = os.path.join(d, "%d.png.tmp" % iid)
+            with open(tmp, "wb") as f:
+                f.write(png)
+            os.replace(tmp, os.path.join(d, "%d.png" % iid))
+        except OSError:
+            pass
+        return png
+
+    # -- public -----------------------------------------------------------
+    def png(self, iid):
+        if iid <= 0:
+            return None
+        with self._lock:
+            if iid in self._missing:
+                return None
+            data = self._folder_png(iid)
+            if data is None:
+                data = self._dat_png(iid)
+            if data is None:
+                self._missing.add(iid)
+            else:
+                self.found_any = True
+            return data
+
+
+_ICONS = _IconStore()
+
+
+class IconLoader:
+    """Turns item ids into Tk images, off the main thread.
+
+    One worker, newest request first: the row you just scrolled to matters more than
+    one from two screens ago. Decoded images are kept for the life of the process --
+    a PhotoImage is a few KB, and Tk drops an image the moment nothing references it."""
+
+    def __init__(self, widget, on_ready):
+        self._w = widget
+        self._on_ready = on_ready
+        self._images = {}            # iid -> PhotoImage (also the reference that keeps it alive)
+        self._pending = set()
+        self._queue = _collections.deque()
+        self._wake = threading.Event()
+        self._thread = None
+
+    def peek(self, iid):
+        return self._images.get(iid)
+
+    def request(self, iid):
+        if iid in self._images or iid in self._pending:
+            return
+        self._pending.add(iid)
+        self._queue.append(iid)
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        self._wake.set()
+
+    def _run(self):
+        while True:
+            try:
+                iid = self._queue.pop()          # newest first
+            except IndexError:
+                self._wake.clear()
+                self._wake.wait(0.5)
+                continue
+            png = _ICONS.png(iid)
+            try:
+                self._w.after(0, self._deliver, iid, png)
+            except tk.TclError:
+                return                       # window closed; nothing to deliver to
+
+    def _deliver(self, iid, png):
+        self._pending.discard(iid)
+        if png:
+            try:
+                self._images[iid] = tk.PhotoImage(
+                    data=base64.b64encode(png).decode("ascii"))
+            except tk.TclError:
+                return
+            self._on_ready(iid)
+
+
+# ── element icons ──
+# Descriptions carry the eight elements as private-use characters E000-E007. No
+# desktop font has a glyph for those, so a plain label renders a stray CJK character
+# where the element belongs -- Sirocco Kukri reads as two symbols rather than Ice-7
+# Wind+7. The game's own icons are embedded here and drawn inline at text height.
+_ELEM_ORDER = ["Fire", "Ice", "Wind", "Earth", "Lightning", "Water", "Light", "Dark"]
+_ELEM_COLOR = {"Fire": "#e58a6a", "Ice": "#9bd3e0", "Wind": "#9ad39a",
+               "Earth": "#c9b37a", "Lightning": "#d98ad9", "Water": "#7fb0dc",
+               "Light": "#ededed", "Dark": "#b89ae0"}
+_ELEM_PNG = {
+    "fire": (
+        "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"
+    ),
+    "ice": (
+        "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"
+        "AABJRU5ErkJggg=="
+    ),
+    "wind": (
+        "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"
+    ),
+    "earth": (
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACx"
+        "jwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAR0SURBVFhHtZctlKtKEIQjI5FIJDIyEolEIpFI"
+        "JBIZGRkZGRkZGRm5MnLllU+um1vf9HT+3u6+5O59c04fCEymqqt6Gpi9MvJsHsoyC01dhK5dhGlY"
+        "hmmswnbdhMOuC7tNo99lqCvmzcN8Pgvprz8bLJQJfLHIQy3woTfg9aoOG8V2XYf9thWBOqxEoGmY"
+        "O4//SUv8bDh43y3Deqpjtsd9r+h03oT9phJ4JTIL3S80LxPRLBTFD1XIc5O8bcowSm6yfDsM4f00"
+        "hvNpCKdDGw5bLCilRhFWUy4CmayBbB6qZRZYIy332siyWVgu8+j1Rh4beB/OxzGSIPPtWvcAHgUa"
+        "Y57OcxHGLlMhLfn8gHVVFdHnHcBHgDsBd+GE7NtGkmOH5gyZamIWYxyMwEoEiE5WVJWp8JIVZD4M"
+        "VfT6JFADRgW8XsZA+p0UAMjBJycgK4ihz2VfHm1E0bT81wOWsO26hUAaeY3fvQi0KjgjsE8EOG5W"
+        "ZZR76OdGIGbvBMwWSGDFU9sSlotFpsUWAmtM9ig9/ltw7Rj9pzCZm8BvCWCBSPCbOV37pBULSdUr"
+        "ewoO6VHgLAUIlDirFiBE9mTed3gPOJXv4DckdHQScVeIxJdKcLFW4a1Xyvw0hfe3Kfw6ryw4f6P6"
+        "aTbqgHFRZe7SO4FPSDDX73+pBNJTKNNYh+NhDB+/topd+HjfRALn4yBwtVoVHQtZ5rM7YD/eE7iG"
+        "9QdTYnnbH2DCXm3qUtl1yn4VPv7ZW4gANhy2tFzAtb+Vdaz6S+UbgB+/inU6Mq+hKL1LWuEhVSXf"
+        "8XyM8mMDrZbKX0tKgPtWmXdJ+ov8Vwu+I4ECHJnTNje14B2PBwsFxnZjm5HxakxdLvkNeCTgJAZT"
+        "wesh9gGFZ3sb0QId47ZUHRRugRNYTTSeWuCl/jCLPreNjjHrJDmgkYSKkPO7MDKPwBbsCHs+uPyZ"
+        "FyEyUIBdV6jnl9rfubLXgsrOJb+TPQUkPPzapRPehElvzwa64lJ9hqQjuA+rA3msxXigrCcWc/Ab"
+        "kCj5vRKDtlaMRBKZvRN69t6S6TOfviOgAtuCPdq3lgmLOYHxjoDd8/u9wD2YS5GRdcw8+s4TVfs/"
+        "bb1YeF8NtiMTbbErAc/uEpBISjiJTpXNceyNBFuWzLvWZL/s++8Gk5hsiwnkQiLFI4FHEgLrCRVb"
+        "1xYquGvT+TZzH0wqCr1OVVpAJO7AU7gKkHFCXDcV+J/8FjBtvSzz5zL3AQGKBBUakYjZYIfUeCRC"
+        "wXLvGiY3QeaVtjbJvP5iGlWABJno9VsZOUgkouDcs72EE9A5ClrFPyH7ZwPZaM9XAlc1eupDgUUG"
+        "yjeC3oQTeNsUsbH90bugD6sFdoT5GUG08CVbjwRu4d679H+YvQ/7FvCCdALE4+8iZk0wl+yfrvr/"
+        "GmaFfYoBcFWCKHWNsHvMMemzvwPOuLXCvgfLf2V9R0B189K2e2YYiSxmd1HiAZzvRd92fy3720E9"
+        "sLgrcQvOb677g+Z/IcCivjUptEcCSI9Vr4PPZr8BKuBHdKe6kcYAAAAASUVORK5CYII="
+    ),
+    "lightning": (
+        "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"
+        "RU5ErkJggg=="
+    ),
+    "water": (
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACx"
+        "jwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAARqSURBVFhHtZchd+pAFIQrkZFIJBIZGYmMRCIj"
+        "IyORSCQSWVmJRFY+iXyyP+G5vPlm74YU2lPaQ/ecewgk2Zk7d/bu8vSdMSmm/XRR9vNlrVhG1P6N"
+        "e/HY741iNutnVdUvVut3MSurvpjOfpnAZKJMFwZcdttLtJt+Ua98j2fi6QePSdGTPUDLtutX20O/"
+        "2kXomt+4xzO/QmIynVrmsmmd9Wqz7+vNTuB7k1jquly3yQt6Nl570ED6shRAY1AD8ykivhaBmhCp"
+        "ctX42afiUSoInIxwe2XpU+Z1F8F1qLDeP5vUvK6TCo8ohaWX6ytJX28kPWDXBFBBPmgOLyKhcnQb"
+        "vbN8TCmK+dyuH4DicwzONZ6wIaUCSkDYq+LHA+nl6Dmul6xrJsd41D1nP0Tygksh8Ob5KDJ7E/9x"
+        "KXhxKtdXTaeJdx8SWEb4e6iBCi6FPukPlO9HpUA+XG9ZCda95Y5sAW+JkSIQkAqUIPkhl0Kr4ltD"
+        "ksEcMzGJCcS6ByibMHXBCJNIJuWdVmVoX456Z2tD3l0GS6/sYb5WHckEAlniTAIwJK4cXCc1IOcy"
+        "iEB3fNX7UqFNhrxrs7LrZbyV6t4gJQooq/cEArxJkVRIJTE5VBDx9uUkIkpA392mNXfAfDJG0pNB"
+        "rqMVgEQQQfoE3kVkEgpKw5KEvMtwcjlSb6i+KEVReG8HhJfIgokcNuKIgBXotDdcSLgUXSJqI1IG"
+        "EzhZNbopGIE2GmI10Y0C50ft04tSQRISgxJXCpTrFIMSVkA+uCIAeVYVGGAFcgzAZ3Nnv5Rraafd"
+        "8dRvT6/9RkbCzWuZiUnZcMg+A1+HiYngYMRIxH1BZUAFsAI5jex8r3uBU/vt6dTvX/84uO5EwkRE"
+        "AgWS9MgeYUXyd/UGyoARUZFSoh7dURg3LRpJ+JGbAHR6aXdK4ATXqLHVJxMyuYFEJHfDFHxPwTMo"
+        "NvgIAlGGGwIuQWw6PNiq5gCaxJ9zf1A8n//2L3/f/BtyXghgyA+Ce/ICoD4r6JPvi3otrI8I2APa"
+        "eDCQXqB2kAD8cD73x7e3/vXfPxE5uzekeitc+1YHkQh/l0eiJEkNzCsCIgbGbT9gFcTmQ22XYpvW"
+        "8HEgkQlw3YjgAKqMyCpFo2ilpM6HCu5DwuAqkY9swph8dHr2MpQ0PnYFAeqH+XbywUEleFYJIEQJ"
+        "EgEAR+ACvIAnZUxAvYGyZPlvlyEjeoGXIptQmCc7eaOSEHY0S5EeAOB15pLfBPKSFDAtmmdnZZyS"
+        "Pu2GusHWaRW0ZDIBVgZZ0x/Ylun3nnwgQZA54CMCAU7tIept+VPwGKknQIIzYDKknaxrDDosOU0K"
+        "CZvOkuuawICKqkngPLPgpHz3cT0MyR5uEgL3YYTMFfT6GwKjyMAGJ3OBDwfUr7Ifj6wEvYGzQdr7"
+        "WeOXyXMZctiYNh6KJH/cn/n1CCVwLX80MCfZeH0HkUQgBcsXcEDzv2U7/ruZ3wxeZomqfc40sWWG"
+        "gI2YVQgCOF1y+/Qz1VK7C/jp6T+aEcVp/DH27gAAAABJRU5ErkJggg=="
+    ),
+    "light": (
+        "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"
+        "LuEAAAAASUVORK5CYII="
+    ),
+    "dark": (
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACx"
+        "jwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAPcSURBVFhHzZetc+tADMQNDQ0NDQ0DAw0NAwML"
+        "AwMDCwv7H/vpp9OeZceZaVPyPLNjv/vQrla6S19z9LRNu4ztuJzb8wZTNy1zNy9zH+DbwHhed2pP"
+        "vr9v+oVYEfbnT9d0WwHdSn7pL0+oImydI0S8JQDyoRmqgJw1ZNfh+oz+WoSEK3JkbH7pgshRX8kt"
+        "KCQf48dyG2/L7XRb7qd7wbm8GWOONayVK9kJYgfN8YPKfebKmOAQPc4Px+f0WTCX92Mq4xIiEdUJ"
+        "i6meCLr1gXifuWr9MaxZZ9TsDZBXQYgJIbghJ6Z2csiNoC4P5Ay+ylzWXoaocQJjzMmVr/mrikBk"
+        "diK7sekLGoVB1GVyAueaKkhGdcrWkbW7QVkM1QlzkTUI1j74VgFBLuud3DYBvt3C2OjirON9HoGs"
+        "SSeAMXfiUpygRLkniAU2AiDfZy8osMbVD2Qnmxlj3hOwtcxTCpXjjhOU0cWWewO+eipy9kxmQEpW"
+        "3nTpFDi5mtC+WSOXIFI/AMqCKDkBuKy2AmxApASRGGVbm2t33DSPOG/SsJg5+uD78u1vFxtugamf"
+        "lq59IUAngawIDrHOO4EYVyZkq6CMKwHEIBYB7kKIZN19vHup+jaO4yqgHK1cy0oeAgjAHHuAu2X/"
+        "VlMi6lCAfVcB9p6HAwEEIoNs/16Aaq2rdWgH36uTILCO9YcC9g6QsWxXDclEArz+JgAbGUewjhAi"
+        "+Dd7PHPIzQ3Wsi8LYEy9s+mBLEDIDmQBWAshDgBd3+yppTMC1nMXSABxNgLMtXoKJEDwjKhr2EgA"
+        "z8ICMMYca7hMuEX51l4colEhr8gCjByHKNvmGJYg5Q3IaC+AbzJQo7EOAdkF9tTmE3m491KAZxLX"
+        "sYJ6YxkRm1zALhOIKIdbb2vlGHMQbgTYHt0DkNOw8DwJEMgIO+kDNj4FJCO62ua8pgGRs0brlb1O"
+        "AEkRdyMAwoFfxLBTP81+oxHYyETub0MWpHHGBI1XoWE9TpHc5ue4CFghAdjLxlqGjB1hBnNkXhvP"
+        "koAcEJO7w4n1YAXQ0eIbIdjkxzFEkA1BwZOgEMVbxF5z6wtsJ/NDcj3YIQECJWHT1ZqNLLASEVmI"
+        "k6Ux/1bWkMcNSTL15nv1IKK4oXf5v0ERsf5h6h0N+Ka5osG8zpExpIC9qnnQ/OxBDKAUfsHwV5AF"
+        "F2klT6SyWteyyEmCZCL07x42ol5nHRI1VIYLMJEihxjoXnlbgB5EEIzgkMhiyGX/bYi/eHZCcID9"
+        "9di9+5CFjipBESRn/K8hOt1Rbkfm6XrW/9kBPeoNQFAvkXV3Bj+zmtPa2P4/Pk3zD9ISuS1KREor"
+        "AAAAAElFTkSuQmCC"
+    ),
+}
+_elem_images = {}
+
+
+def _elem_for(ch):
+    i = ord(ch) - 0xE000
+    return _ELEM_ORDER[i] if 0 <= i < len(_ELEM_ORDER) else None
+
+
+def _elem_image(name):
+    """32x32 halved to 16 so it sits on the text line. Built once, then cached --
+    the card redraws on every keystroke in the search box."""
+    if name in _elem_images:
+        return _elem_images[name]
+    img = None
+    try:
+        img = tk.PhotoImage(data=_ELEM_PNG[name.lower()]).subsample(2, 2)
+    except Exception:
+        img = None
+    _elem_images[name] = img
+    return img
+
+
+# ─────────────────────── the results list ───────────────────────
+#
+# A Listbox cannot hold an image, so the results panel is drawn on a canvas: an
+# accent bar, the icon, the name, and the category under it -- the same row the
+# phone app draws. With no icons installed it collapses to a single line of text
+# and the panel looks exactly as it did before.
+
+_ROW_H_ICON = 38
+_ROW_H_PLAIN = 22
+
+
+class ResultsList(tk.Frame):
+    def __init__(self, master, on_pick, on_context, **kw):
+        tk.Frame.__init__(self, master, bg="#14141c", **kw)
+        self._on_pick = on_pick
+        self._on_context = on_context
+        self.canvas = tk.Canvas(self, bg="#14141c", highlightthickness=0, bd=0)
+        self.bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.bar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.rows = []          # (label, category, item_id)
+        self.sel = None
+        self.icons = IconLoader(self.canvas, self._icon_ready)
+        self._name_font = ("Segoe UI", 10)
+        self._sub_font = ("Segoe UI", 8)
+        self._redraw_after = None
+        self.canvas.bind("<Button-1>", self._click)
+        self.canvas.bind("<Button-3>", self._right)
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
+        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
+
+    # -- data -------------------------------------------------------------
+    def set_rows(self, rows):
+        self.rows = rows
+        self.sel = None
+        self.canvas.yview_moveto(0)
+        for _label, _cat, iid in rows[:400]:
+            self.icons.request(iid)
+        self._redraw()
+
+    def row_height(self):
+        return _ROW_H_ICON if _ICONS.found_any else _ROW_H_PLAIN
+
+    # -- drawing ----------------------------------------------------------
+    def _redraw(self):
+        c = self.canvas
+        c.delete("all")
+        h = self.row_height()
+        w = max(c.winfo_width(), 60)
+        total = h * len(self.rows)
+        c.configure(scrollregion=(0, 0, w, max(total, 1)))
+        top = c.canvasy(0)
+        first = max(0, int(top // h) - 2)
+        last = min(len(self.rows), first + int(c.winfo_height() // h) + 5)
+        icons_on = _ICONS.found_any
+        for i in range(first, last):
+            label, cat, iid = self.rows[i]
+            y = i * h
+            if i == self.sel:
+                c.create_rectangle(0, y, w, y + h, fill="#33415c", width=0)
+            c.create_rectangle(0, y + 2, 3, y + h - 2, fill="#4f7a58", width=0)
+            x = 12
+            if icons_on:
+                img = self.icons.peek(iid)
+                if img is not None:
+                    c.create_image(x + 16, y + h // 2, image=img)
+                x += 40
+            if icons_on and cat:
+                c.create_text(x, y + 9, text=label, anchor="w", fill="#c8cede",
+                              font=self._name_font)
+                c.create_text(x, y + 26, text=cat, anchor="w", fill="#7c8296",
+                              font=self._sub_font)
+            else:
+                c.create_text(x, y + h // 2, text=label, anchor="w",
+                              fill="#c8cede", font=self._name_font)
+
+    def _icon_ready(self, iid):
+        # The first icon to resolve is also what tells the panel icons exist at all.
+        # A search can resolve three hundred of them, so coalesce: one redraw for
+        # however many land in the same few frames.
+        if self._redraw_after is None:
+            self._redraw_after = self.after(40, self._redraw_now)
+
+    def _redraw_now(self):
+        self._redraw_after = None
+        self._redraw()
+
+    # -- input ------------------------------------------------------------
+    def _index_at(self, ev):
+        i = int(self.canvas.canvasy(ev.y) // self.row_height())
+        return i if 0 <= i < len(self.rows) else None
+
+    def _click(self, ev):
+        i = self._index_at(ev)
+        if i is None:
+            return
+        self.sel = i
+        self._redraw()
+        self._on_pick(i)
+
+    def _right(self, ev):
+        i = self._index_at(ev)
+        if i is None:
+            return
+        self.sel = i
+        self._redraw()
+        self._on_context(i, ev)
+
+    def _wheel(self, ev):
+        self.canvas.yview_scroll(-1 * (ev.delta // 120) * 3, "units")
+        self._redraw()
+
+
+# ─────────────────────── the item card ───────────────────────
+#
+# The client's item help window -- the panel the game draws when you highlight an
+# item, and the same thing the wiki's item images are screenshots of. Nothing here
+# is fetched: the window is composed from the description string and the icon in
+# the item record, both of which are already on this PC. The description is drawn
+# verbatim in a monospace face so the stat columns line up the way they do in game.
+#
+# MISSING vs the real window: the "(Dagger)All Races" line. Weapon skill and race
+# mask are not in ffxi_items.json -- they are `skill` and `races` in Windower's
+# items.lua, so that line appears as soon as those two fields are in the bundled
+# JSON, with no change here.
+
+_CARD_BG = "#23232e"
+_CARD_PAD_X = 12
+_CARD_PAD_Y = 10
+
+
+class ItemCard(tk.Canvas):
+    def __init__(self, master, **kw):
+        tk.Canvas.__init__(self, master, bg="#1e1e28", highlightthickness=0,
+                           bd=0, height=90, **kw)
+        self.item = None
+        self.iid = None
+        self.icons = IconLoader(self, lambda iid: self.redraw())
+        self._name_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
+        self._mono = tkfont.Font(family="Consolas", size=9)
+        self._small = tkfont.Font(family="Segoe UI", size=8)
+        self._flag = tkfont.Font(family="Segoe UI", size=8, weight="bold")
+        self._last_w = 0
+        self.bind("<Configure>", self._on_resize)
+
+    def show(self, iid, item):
+        self.iid = iid
+        self.item = item
+        if iid:
+            self.icons.request(iid)
+        self.redraw()
+
+    def _on_resize(self, ev):
+        if abs(ev.width - self._last_w) > 2:
+            self._last_w = ev.width
+            self.redraw()
+
+    # -- text layout ------------------------------------------------------
+    def _tokens(self, line):
+        """A line as a list of ('t', text) / ('e', element) tokens, split on words."""
+        out, buf = [], ""
+        for ch in line:
+            el = _elem_for(ch)
+            if el:
+                if buf:
+                    out.append(("t", buf))
+                    buf = ""
+                out.append(("e", el))
+            elif ch == " ":
+                buf += ch
+                out.append(("t", buf))
+                buf = ""
+            else:
+                buf += ch
+        if buf:
+            out.append(("t", buf))
+        return out
+
+    def _wrap(self, line, maxpx):
+        """Wrap into display lines. An element icon is 16px wide whatever the font."""
+        lines, cur, x = [], [], 0
+        for kind, val in self._tokens(line):
+            w = 16 if kind == "e" else self._mono.measure(val)
+            if cur and x + w > maxpx:
+                lines.append(cur)
+                cur, x = [], 0
+                if kind == "t" and not val.strip():
+                    continue            # a wrapped-away trailing space
+            cur.append((kind, val))
+            x += w
+        lines.append(cur)
+        return lines or [[]]
+
+    def _draw_tokens(self, x, y, toks, fill):
+        for kind, val in toks:
+            if kind == "e":
+                img = _elem_image(val)
+                if img is not None:
+                    self.create_image(x + 8, y, image=img)
+                    self._keep.append(img)
+                else:
+                    self.create_text(x, y, text=val, anchor="w",
+                                     fill=_ELEM_COLOR.get(val, "#c2c8d6"),
+                                     font=self._mono)
+                x += 16
+            else:
+                self.create_text(x, y, text=val, anchor="w", fill=fill,
+                                 font=self._mono)
+                x += self._mono.measure(val)
+
+    def _round_rect(self, x0, y0, x1, y1, r, **kw):
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+               x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    # -- the card ---------------------------------------------------------
+    def redraw(self):
+        self.delete("all")
+        self._keep = []                      # canvas images need a live reference
+        it = self.item
+        if not it:
+            self.configure(height=8)
+            return
+        W = max(self.winfo_width(), 320)
+        panel_w = W - 2 * _CARD_PAD_X
+        img = self.icons.peek(self.iid) if self.iid else None
+
+        # Reserve the tile as soon as we know icons exist at all, so the text does
+        # not jump sideways when one resolves a frame after the card is drawn.
+        text_x = _CARD_PAD_X + 12 + (42 if _ICONS.found_any else 0)
+        flags = [f for f in (it.get("re") or "").split("/") if f]
+        flag_w = (max(self._flag.measure(f) for f in flags) + 14) if flags else 0
+        text_w = max(60, panel_w - (text_x - _CARD_PAD_X) - 12 - flag_w)
+
+        y = _CARD_PAD_Y + 10
+        self.create_text(text_x, y, text=it.get("n", ""), anchor="w",
+                         fill="#e6e6f0", font=self._name_font)
+        y += 16
+
+        desc = it.get("d") or ""
+        if desc:
+            y += 5
+            for raw in desc.split("\n"):
+                for toks in self._wrap(raw, text_w):
+                    self._draw_tokens(text_x, y + 7, toks, "#c2c8d6")
+                    y += 17
+
+        # Lv + jobs, the way the help window prints it.
+        jobs = _jobs_str(it.get("j", 0))
+        lv = it.get("lv", 0)
+        if jobs == "All jobs":
+            jline = "Lv.%d All Jobs" % lv if lv else "All Jobs"
+        elif jobs:
+            jline = ("Lv.%d " % lv if lv else "") + jobs.replace(" ", "/")
+        else:
+            jline = ""
+        if jline:
+            y += 3
+            for toks in self._wrap(jline, text_w):
+                self._draw_tokens(text_x, y + 7, toks, "#9ab0d0")
+                y += 17
+
+        stack, ilv = it.get("s", 1), it.get("il", 0)
+        if stack > 1 or ilv:
+            y += 6
+            if stack > 1:
+                self.create_text(text_x, y + 6, text="Stacks to %d" % stack,
+                                 anchor="w", fill="#8a90a2", font=self._small)
+            if ilv:
+                self.create_text(_CARD_PAD_X + panel_w - 12, y + 6,
+                                 text="<Item Level:%d>" % ilv, anchor="e",
+                                 fill="#8a90a2", font=self._small)
+            y += 14
+
+        bottom = max(y + _CARD_PAD_Y, _CARD_PAD_Y + 52)
+        panel = self._round_rect(_CARD_PAD_X, _CARD_PAD_Y,
+                                 _CARD_PAD_X + panel_w, bottom, 8,
+                                 fill=_CARD_BG, outline="#2f2f3d")
+        self.tag_lower(panel)                 # drawn last, sits behind the text
+
+        if img is not None:
+            self.create_image(_CARD_PAD_X + 12 + 16, _CARD_PAD_Y + 12 + 16, image=img)
+
+        # Rare / Ex sit in the window's top-right corner, as they do in game.
+        fy = _CARD_PAD_Y + 8
+        for f in flags:
+            col = "#8fd39a" if f.strip().lower() == "rare" else "#7fc4c9"
+            fw = self._flag.measure(f) + 12
+            fx = _CARD_PAD_X + panel_w - 10 - fw
+            self._round_rect(fx, fy, fx + fw, fy + 16, 4, fill="#2c3340",
+                             outline="")
+            self.create_text(fx + fw / 2, fy + 8, text=f, fill=col,
+                             font=self._flag)
+            fy += 19
+
+        self.configure(height=bottom + 2)
+
+
 # ─────────────────────────── the app ───────────────────────────
 class AHBrowser(tk.Tk):
     def __init__(self):
@@ -930,7 +2035,7 @@ class AHBrowser(tk.Tk):
         self._cur_id = None
         self._pop_busy = False
         self._cat_cache = {}   # AH category -> {itemid: (singles, stacks)}
-        self._xs_cache = {}    # item_id -> [(world, median), ...] this session
+        self._xs_cache = {}    # item_id -> {"single":[(world,med)..], "stack":[..]}
         self._hist_rows = []
         self._sort_col = "date"
         self._sort_rev = True   # newest first by default
@@ -985,9 +2090,7 @@ class AHBrowser(tk.Tk):
 
         # left: results
         left = tk.Frame(body, bg="#1e1e28")
-        self.results = tk.Listbox(left, activestyle="none", bg="#14141c",
-                                  fg="#c8cede", highlightthickness=0,
-                                  selectbackground="#33415c", width=34)
+        self.results = ResultsList(left, self._pick, self._results_rightclick)
         # cross-server median-price ranking for the selected item, filling the
         # empty results-panel space (all 16 worlds queried in parallel).
         self.xserver = tk.Listbox(left, activestyle="none", bg="#12121a",
@@ -999,24 +2102,15 @@ class AHBrowser(tk.Tk):
                                anchor="w", font=("Segoe UI", 8))
         self.xs_lbl.pack(side="bottom", fill="x", padx=2, pady=(4, 1))
         self.results.pack(fill="both", expand=True)
-        self.results.bind("<<ListboxSelect>>", lambda e: self._pick())
-        self.results.bind("<Button-3>", self._results_rightclick)
         body.add(left, minsize=220)
 
         # right: detail
         right = tk.Frame(body, bg="#1e1e28")
-        self.name_lbl = tk.Label(right, text="", bg="#1e1e28", fg="#e6d29a",
-                                 font=("Segoe UI", 14, "bold"), anchor="w")
-        self.name_lbl.pack(fill="x", padx=8, pady=(6, 0))
-        self.meta_lbl = tk.Label(right, text="", bg="#1e1e28", fg="#9aa0b2",
+        self.card = ItemCard(right)
+        self.card.pack(fill="x", padx=4, pady=(6, 0))
+        self.meta_lbl = tk.Label(right, text="", bg="#1e1e28", fg="#7c8296",
                                  anchor="w")
-        self.meta_lbl.pack(fill="x", padx=8)
-        self.jobs_lbl = tk.Label(right, text="", bg="#1e1e28", fg="#9ab0d0",
-                                 anchor="w", justify="left", wraplength=560)
-        self.jobs_lbl.pack(fill="x", padx=8)
-        self.desc_lbl = tk.Label(right, text="", bg="#1e1e28", fg="#c2c8d6",
-                                 anchor="w", justify="left", wraplength=560)
-        self.desc_lbl.pack(fill="x", padx=8, pady=(4, 8))
+        self.meta_lbl.pack(fill="x", padx=17, pady=(1, 8))
 
         cols = ("date", "price", "seller", "buyer")
         hdr = tk.Frame(right, bg="#1e1e28"); hdr.pack(fill="x", padx=8)
@@ -1183,12 +2277,9 @@ class AHBrowser(tk.Tk):
         self._save_ui_state()
         self.destroy()
 
-    def _results_rightclick(self, event):
-        idx = self.results.nearest(event.y)
+    def _results_rightclick(self, idx, event):
         if idx is None or idx < 0 or idx >= len(getattr(self, "_hits", [])):
             return
-        self.results.selection_clear(0, "end")
-        self.results.selection_set(idx)
         name, iid = self._hits[idx]
         ffxiah = "https://www.ffxiah.com/item/%d" % iid
         bgwiki = "https://www.bg-wiki.com/ffxi/" + name.replace(" ", "_")
@@ -1203,36 +2294,28 @@ class AHBrowser(tk.Tk):
             menu.grab_release()
 
     def _do_search(self):
-        self.results.delete(0, "end")
         self._hits = search_items(self.q.get())
-        for (n, i) in self._hits:
-            self.results.insert("end", n)
+        self.results.set_rows([(_list_label(n, i),
+                                ITEMS.get(str(i), {}).get("c", ""), i)
+                               for (n, i) in self._hits])
 
-    def _pick(self):
-        sel = self.results.curselection()
-        if not sel:
+    def _pick(self, idx):
+        try:
+            _name, iid = self._hits[idx]
+        except (AttributeError, IndexError):
             return
-        name, iid = self._hits[sel[0]]
         self._cur_id = iid
         it = ITEMS.get(str(iid), {})
-        self.name_lbl.config(text=name)
-        bits = ["id %d" % iid]
-        if it.get("re"):
-            bits.append(it["re"])
+        # The card is the game's own help window; the strip under it carries the
+        # things that window does not show and the browser needs.
+        self.card.show(iid, it)
+        bits = ["id %d" % iid, it.get("c", "?")]
         sl = _slot_str(it.get("sl", 0))
         if sl:
             bits.append(sl)
-        if it.get("lv"):
+        if it.get("lv") and not it.get("j"):
             bits.append("Lv %d" % it["lv"])
-        if it.get("il"):
-            bits.append("iLv %d" % it["il"])
-        bits.append(it.get("c", "?"))
-        if it.get("s", 1) > 1:
-            bits.append("stack %d" % it["s"])
         self.meta_lbl.config(text="   \u00b7   ".join(bits))
-        js = _jobs_str(it.get("j", 0))
-        self.jobs_lbl.config(text=("Jobs:  " + js) if js else "")
-        self.desc_lbl.config(text=it.get("d", ""))
         self._refresh_current()
         self._refresh_population()
         self._compare_servers(iid)
@@ -1262,6 +2345,12 @@ class AHBrowser(tk.Tk):
         for key, b in self._filter_btns.items():
             b.config(bg="#33415c" if key == k else "#2a2a38")
         self._render_rows()
+        if self._cur_id is not None:
+            self._compare_servers(self._cur_id)
+
+    def _xs_form(self):
+        # cross-server medians follow the Singles/Stacks toggle (All -> singles)
+        return "stack" if self._type_filter == "stack" else "single"
 
     def _render_rows(self):
         for r in self.tree.get_children():
@@ -1306,11 +2395,14 @@ class AHBrowser(tk.Tk):
             self.hist_lbl.config(text="Auction history  —  no data / no answer")
 
     def _compare_servers(self, iid):
-        # Fan the item's median-price query out across every world with a known
-        # address, in parallel, and rank cheapest -> priciest in the left panel.
-        cached = self._xs_cache.get(iid)
+        # Fan the item's median-price query (for the currently-selected form)
+        # out across every world with a known address, in parallel, and rank
+        # cheapest -> priciest in the left panel. Each form is cached so toggling
+        # Singles/Stacks is instant after the first fetch.
+        form = self._xs_form()
+        cached = self._xs_cache.get(iid, {}).get(form)
         if cached is not None:
-            self._render_xservers(iid, cached)
+            self._render_xservers(iid, cached, form)
             return
         worlds = [(w, self._servers.get(w)) for w in _WORLDS
                   if self._servers.get(w)]
@@ -1318,13 +2410,14 @@ class AHBrowser(tk.Tk):
             return
         self.xserver.delete(0, "end")
         self.xs_lbl.config(text="comparing %d servers\u2026" % len(worlds))
+        stack = (form == "stack")
 
         def _worker():
             import concurrent.futures as _cf
             results = []
             try:
                 with _cf.ThreadPoolExecutor(max_workers=len(worlds)) as ex:
-                    fut = {ex.submit(_ahsrch_median_price, ip, iid): w
+                    fut = {ex.submit(_ahsrch_median_price, ip, iid, stack): w
                            for w, ip in worlds}
                     for f in _cf.as_completed(fut):
                         try:
@@ -1336,18 +2429,20 @@ class AHBrowser(tk.Tk):
             except Exception:
                 pass
             results.sort(key=lambda t: t[1])
-            self._xs_cache[iid] = results
-            self.after(0, lambda: self._render_xservers(iid, results))
+            self._xs_cache.setdefault(iid, {})[form] = results
+            self.after(0, lambda: self._render_xservers(iid, results, form))
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _render_xservers(self, iid, results):
-        if iid != self._cur_id:
-            return   # user moved to another item; drop stale result
+    def _render_xservers(self, iid, results, form):
+        if iid != self._cur_id or form != self._xs_form():
+            return   # stale: user moved to another item or switched filter
         self.xserver.delete(0, "end")
+        noun = "stacks" if form == "stack" else "singles"
         if not results:
-            self.xs_lbl.config(text="no single-sale history on any server")
+            self.xs_lbl.config(text="no %s history on any server" % noun)
             return
-        self.xs_lbl.config(text="median price by server (singles, cheapest first)")
+        self.xs_lbl.config(
+            text="median price by server (%s, cheapest first)" % noun)
         for world, med in results:
             self.xserver.insert("end", " %-13s %13s g" % (world, format(med, ",")))
         self.xserver.itemconfig(0, fg="#8fd39a")                 # cheapest

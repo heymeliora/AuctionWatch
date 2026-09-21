@@ -2,6 +2,18 @@
 
 All notable changes to AuctionWatch are documented here.
 
+## [1.1.0] — 2026-09-20
+
+### Added
+
+- **Item icons** — the game's own icon now sits beside every search result and on the item card. Nothing to install and nothing to point at: the icons are read straight out of the client's item DATs the first time one is needed, then cached under `%APPDATA%\AuctionWatch\itemicons`. A folder of `<id>.png` files is used in preference if you have one — beside the app or under `%APPDATA%\AuctionWatch`, named `itemicons`, `items`, `icons\items` or just `icons`, as well as OmniWatch's extracted set or a MobileWatch checkout sitting alongside. With none of those and no game installed, the panels look exactly as they did before.
+- **Item card** — the detail pane is now the game's item help window, the same panel the wiki's item images are screenshots of: icon, name, the description in a monospace face so the stat columns line up as they do in game, the level and jobs line, stack size, item level, and Rare / Ex in the top-right corner.
+- **Element symbols** in descriptions now draw as the game's own element icons, inline and on the text line — a Sirocco Axe reads Ice+5 Wind+5.
+
+### Changed
+
+- **Results list** — each row now carries the item's icon, with its category under the name.
+
 ## [1.0.3] — 2026-07-04
 
 ### Added
